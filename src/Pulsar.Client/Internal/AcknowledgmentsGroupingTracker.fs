@@ -7,9 +7,12 @@ open System.Collections.Generic
 open Microsoft.Extensions.Logging
 open System.Timers
 open FSharp.UMX
+open System.Threading.Channels
+open FSharp.Control.Tasks.V2.ContextInsensitive
+open System.Threading.Tasks
 
 type internal GroupingTrackerMessage =
-    | IsDuplicate of (MessageId*AsyncReplyChannel<bool>)
+    | IsDuplicate of (MessageId*TaskCompletionSource<bool>)
     | AddAcknowledgment of (MessageId*AckType*IReadOnlyDictionary<string, int64>)
     | AddBatchIndexAcknowledgment of (MessageId*AckType*IReadOnlyDictionary<string, int64>)
     | FlushAndClean
@@ -178,33 +181,27 @@ type internal AcknowledgmentsGroupingTracker(prefix: string, consumerId: Consume
             return ()
         }
     
-    
-    let mb = MailboxProcessor<GroupingTrackerMessage>.Start(fun inbox ->
-        let rec loop ()  =
-            async {
-                let! message = inbox.Receive()
+    let ch = Channel.CreateUnbounded<GroupingTrackerMessage>(UnboundedChannelOptions(SingleReader = true, AllowSynchronousContinuations = true))
+    do task {
+        while(true) do
+            try
+                let! message = ch.Reader.ReadAsync()
                 match message with
                 | GroupingTrackerMessage.IsDuplicate (msgId, channel) ->
-                    
                     if msgId <= lastCumulativeAck then
                         Log.Logger.LogDebug("{0} Message {1} already included in a cumulative ack", prefix, msgId)
-                        channel.Reply(true)
+                        channel.SetResult(true)
                     else
-                        channel.Reply(pendingIndividualAcks.Contains msgId)
-                    return! loop ()
-                    
+                        channel.SetResult(pendingIndividualAcks.Contains msgId)
                 | GroupingTrackerMessage.AddAcknowledgment (msgId, ackType, properties) ->
-                    
                     if ackGroupTime = TimeSpan.Zero || properties.Count > 0 then
                         // We cannot group acks if the delay is 0 or when there are properties attached to it. Fortunately that's an
                         // uncommon condition since it's only used for the compaction subscription
                         do! doImmediateAck msgId ackType properties
                         Log.Logger.LogDebug("{0} messageId {1} has been immediately acked", prefix, msgId)
-                        return! loop ()
                     elif ackType = AckType.Cumulative then
                         // cumulative ack
                         doCumulativeAck msgId false
-                        return! loop ()
                     else
                         // Individual ack
                         if pendingIndividualAcks.Add msgId then
@@ -213,17 +210,12 @@ type internal AcknowledgmentsGroupingTracker(prefix: string, consumerId: Consume
                                 Log.Logger.LogWarning("{0} messageId {1} MAX_ACK_GROUP_SIZE reached and flushed", prefix, msgId)
                         else
                             Log.Logger.LogWarning("{0} messageId {1} has already been added to the ack tracker", prefix, msgId)
-                        return! loop ()
-                        
                 | GroupingTrackerMessage.AddBatchIndexAcknowledgment (msgId, ackType, properties) ->
-                    
                     if ackGroupTime = TimeSpan.Zero || properties.Count > 0 then
                         do! doImmediateBatchIndexAck msgId ackType properties
                         Log.Logger.LogDebug("{0} messageId {1} has been immediately batch index acked", prefix, msgId)
-                        return! loop ()
                     elif ackType = AckType.Cumulative then
                         doCumulativeAck msgId true
-                        return! loop ()
                     else
                         if pendingIndividualBatchIndexAcks.Add(msgId) then
                             if pendingIndividualBatchIndexAcks.Count >= MAX_ACK_GROUP_SIZE then
@@ -231,37 +223,24 @@ type internal AcknowledgmentsGroupingTracker(prefix: string, consumerId: Consume
                                 Log.Logger.LogWarning("{0} messageId {1} MAX_ACK_GROUP_SIZE reached and flushed", prefix, msgId)
                         else
                             Log.Logger.LogWarning("{0} messageId {1} has already been added", prefix, msgId)
-                        return! loop ()
-                
-                        
                 | GroupingTrackerMessage.FlushAndClean ->
-                    
                     do! flush()
                     pendingIndividualAcks.Clear()
                     cumulativeAckFlushRequired <- false
                     lastCumulativeAck <- MessageId.Earliest
-                    return! loop ()
-                    
                 | Flush ->
-                    
                     do! flush()
-                    return! loop ()
-                    
                 | Stop ->
-                    
                     do! flush()
-            }
-        loop ()
-    )
-
-    do mb.Error.Add(fun ex -> Log.Logger.LogCritical(ex, "{0} mailbox failure", prefix))
+            with ex -> Log.Logger.LogCritical(ex, "{0} mailbox failure", prefix)
+        } |> ignore
 
     let timer = new Timer()
     let tryLaunchTimer() =
         if ackGroupTime <> TimeSpan.Zero then
             timer.Interval <- ackGroupTime.TotalMilliseconds
             timer.AutoReset <- true
-            timer.Elapsed.Add(fun _ -> mb.Post Flush)
+            timer.Elapsed.Add(fun _ -> ch.Writer.TryWrite(Flush) |> ignore)
             timer.Start()
     do tryLaunchTimer()
 
@@ -269,19 +248,23 @@ type internal AcknowledgmentsGroupingTracker(prefix: string, consumerId: Consume
         /// Since the ack are delayed, we need to do some best-effort duplicate check to discard messages that are being
         /// resent after a disconnection and for which the user has already sent an acknowledgement.
         member this.IsDuplicate(msgId) =
-            mb.PostAndReply (fun channel -> GroupingTrackerMessage.IsDuplicate (msgId, channel))
+            task {
+                let cts = TaskCompletionSource<bool>(TaskContinuationOptions.RunContinuationsAsynchronously)
+                ch.Writer.TryWrite(GroupingTrackerMessage.IsDuplicate (msgId, cts)) |> ignore
+                let! result = cts.Task
+                return result
+            } |> Async.AwaitTask |> Async.RunSynchronously
         member this.AddAcknowledgment(msgId, ackType, properties) =
-            mb.Post <| GroupingTrackerMessage.AddAcknowledgment (msgId, ackType, properties)
+            ch.Writer.TryWrite(GroupingTrackerMessage.AddAcknowledgment(msgId, ackType, properties)) |> ignore
         member this.AddBatchIndexAcknowledgment(msgId, ackType, properties) =
-            mb.Post <| GroupingTrackerMessage.AddBatchIndexAcknowledgment (msgId, ackType, properties)
+            ch.Writer.TryWrite(GroupingTrackerMessage.AddBatchIndexAcknowledgment(msgId, ackType, properties)) |> ignore
         member this.Flush() =
-            mb.Post GroupingTrackerMessage.Flush
+            ch.Writer.TryWrite(GroupingTrackerMessage.Flush) |> ignore
         member this.FlushAndClean() =
-            mb.Post GroupingTrackerMessage.FlushAndClean
+            ch.Writer.TryWrite(GroupingTrackerMessage.FlushAndClean) |> ignore
         member this.Close() =
             timer.Stop()
-            mb.Post GroupingTrackerMessage.Stop
-
+            ch.Writer.TryWrite(GroupingTrackerMessage.Stop) |> ignore
 
     static member NonPersistentAcknowledgmentGroupingTracker =
         {

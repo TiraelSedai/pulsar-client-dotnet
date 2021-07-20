@@ -72,62 +72,59 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
     let removeConsumer = fun consumer -> this.Ch.Writer.TryWrite(RemoveConsumer consumer) |> ignore
 
     let ch = Channel.CreateUnbounded<PulsarClientMessage>(UnboundedChannelOptions(SingleReader = true, AllowSynchronousContinuations = true))
-    do
-        Task.Run(fun () -> 
-        (task {
-            while(true) do
-                try
-                    let! msg = ch.Reader.ReadAsync()
-                    match msg with
-                    | RemoveProducer producer ->
-                        producers.Remove(producer) |> ignore
-                        tryStopMailbox()
-                    | RemoveConsumer consumer ->
-                        consumers.Remove(consumer) |> ignore
-                        tryStopMailbox ()
-                    | AddProducer producer ->
-                        producers.Add producer |> ignore
-                    | AddConsumer consumer ->
-                        consumers.Add consumer |> ignore
-                    | GetSchemaProvider (channel, topicName) ->
-                        match schemaProviders.TryGetValue(topicName) with
-                        | true, provider -> 
-                            do! Task.Yield()
-                            channel.SetResult(provider)
-                        | false, _ ->
-                            let provider = 
-                               MultiVersionSchemaInfoProvider(fun schemaVersion ->
-                                   lookupService.GetSchema(topicName, schemaVersion))
-                            schemaProviders.Add(topicName, provider)
-                            channel.SetResult(provider)
-                    | Close channel ->
-                        match this.ClientState with
-                        | Active ->
-                            Log.Logger.LogInformation("Client closing. URL: {0}", config.ServiceAddresses)
-                            this.ClientState <- Closing
-                            let producersTasks = producers |> Seq.map (fun producer -> task { return! producer.DisposeAsync() } )
-                            let consumerTasks = consumers |> Seq.map (fun consumer -> task { return! consumer.DisposeAsync() })
-                            let t = task {
-                                try
-                                    let! _ = Task.WhenAll (seq { yield! producersTasks; yield! consumerTasks })
-                                    schemaProviders |> Seq.iter (fun (KeyValue (_, provider)) -> provider.Close())
-                                    config.Authentication.Dispose()
-                                    tryStopMailbox()
-                                with ex ->
-                                    Log.Logger.LogError(ex, "Couldn't stop client")
-                                    this.ClientState <- Active
-                            }
-                            channel.SetResult(t)
-                        | _ ->
-                            channel.SetResult(Task.FromException(AlreadyClosedException("Client already closed. URL: " + config.ServiceAddresses.ToString())))
-                    | Stop ->
-                        this.ClientState <- Closed
-                        do! connectionPool.CloseAsync() |> Async.AwaitTask
-                        transactionClient |> Option.iter (fun tc -> tc.Close())
-                        Log.Logger.LogInformation("Pulsar client stopped")
-                with ex -> Log.Logger.LogCritical(ex, "PulsarClient mailbox failure")
-        }) :> Task
-        ) |> ignore
+    do task {
+        while(true) do
+            try
+                let! msg = ch.Reader.ReadAsync()
+                match msg with
+                | RemoveProducer producer ->
+                    producers.Remove(producer) |> ignore
+                    tryStopMailbox()
+                | RemoveConsumer consumer ->
+                    consumers.Remove(consumer) |> ignore
+                    tryStopMailbox ()
+                | AddProducer producer ->
+                    producers.Add producer |> ignore
+                | AddConsumer consumer ->
+                    consumers.Add consumer |> ignore
+                | GetSchemaProvider (channel, topicName) ->
+                    match schemaProviders.TryGetValue(topicName) with
+                    | true, provider -> 
+                        do! Task.Yield()
+                        channel.SetResult(provider)
+                    | false, _ ->
+                        let provider = 
+                            MultiVersionSchemaInfoProvider(fun schemaVersion ->
+                                lookupService.GetSchema(topicName, schemaVersion))
+                        schemaProviders.Add(topicName, provider)
+                        channel.SetResult(provider)
+                | Close channel ->
+                    match this.ClientState with
+                    | Active ->
+                        Log.Logger.LogInformation("Client closing. URL: {0}", config.ServiceAddresses)
+                        this.ClientState <- Closing
+                        let producersTasks = producers |> Seq.map (fun producer -> task { return! producer.DisposeAsync() } )
+                        let consumerTasks = consumers |> Seq.map (fun consumer -> task { return! consumer.DisposeAsync() })
+                        let t = task {
+                            try
+                                let! _ = Task.WhenAll (seq { yield! producersTasks; yield! consumerTasks })
+                                schemaProviders |> Seq.iter (fun (KeyValue (_, provider)) -> provider.Close())
+                                config.Authentication.Dispose()
+                                tryStopMailbox()
+                            with ex ->
+                                Log.Logger.LogError(ex, "Couldn't stop client")
+                                this.ClientState <- Active
+                        }
+                        channel.SetResult(t)
+                    | _ ->
+                        channel.SetResult(Task.FromException(AlreadyClosedException("Client already closed. URL: " + config.ServiceAddresses.ToString())))
+                | Stop ->
+                    this.ClientState <- Closed
+                    do! connectionPool.CloseAsync() |> Async.AwaitTask
+                    transactionClient |> Option.iter (fun tc -> tc.Close())
+                    Log.Logger.LogInformation("Pulsar client stopped")
+            with ex -> Log.Logger.LogCritical(ex, "PulsarClient mailbox failure")
+        } |> ignore
 
     static member Logger
         with get () = Log.Logger
