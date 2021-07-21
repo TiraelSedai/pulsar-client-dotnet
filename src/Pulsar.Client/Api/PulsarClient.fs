@@ -42,12 +42,12 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
             TransactionCoordinatorClient(config, connectionPool, lookupService) |> Some
         else
             None
-
-    let tryStopMailbox() =
+    
+    let rec tryStopMailbox() =
         match this.ClientState with
         | Closing ->
             if consumers.Count = 0 && producers.Count = 0 then
-                this.Ch.Writer.TryWrite(Stop) |> ignore
+                post this.Mb Stop
         | _ ->
             ()
 
@@ -69,13 +69,12 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
             return activeSchema
         }
     
-    let removeConsumer = fun consumer -> this.Ch.Writer.TryWrite(RemoveConsumer consumer) |> ignore
 
-    let ch = Channel.CreateUnbounded<PulsarClientMessage>(UnboundedChannelOptions(SingleReader = true, AllowSynchronousContinuations = true))
+    let channel = Channel.CreateUnbounded<PulsarClientMessage>(UnboundedChannelOptions(SingleReader = true, AllowSynchronousContinuations = true))
     do task {
         while(true) do
             try
-                let! msg = ch.Reader.ReadAsync()
+                let! msg = channel.Reader.ReadAsync()
                 match msg with
                 | RemoveProducer producer ->
                     producers.Remove(producer) |> ignore
@@ -126,6 +125,9 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
             with ex -> Log.Logger.LogCritical(ex, "PulsarClient mailbox failure")
         } |> ignore
 
+    let removeConsumer = fun consumer -> post channel (RemoveConsumer consumer)
+    let addConsumer = fun consumer -> post channel (AddConsumer consumer)
+
     static member Logger
         with get () = Log.Logger
         and set (value) = Log.Logger <- value
@@ -153,18 +155,14 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
     member this.CloseAsync() =
         task {
             checkIfActive()
-            let cts = TaskCompletionSource<Task>(TaskContinuationOptions.RunContinuationsAsynchronously)
-            do! ch.Writer.WriteAsync(Close(cts))
-            let! t = cts.Task
+            let! t = postAndAsyncReply channel Close
             return! t
         }
     
     member private this.PreProcessSchemaBeforeSubscribe(schema: ISchema<'T>, topicName) =
         task {
             if schema.SupportSchemaVersioning then
-                let cts = TaskCompletionSource<MultiVersionSchemaInfoProvider>(TaskContinuationOptions.RunContinuationsAsynchronously)
-                do! ch.Writer.WriteAsync(GetSchemaProvider(cts, topicName))
-                let! provider = cts.Task
+                let! provider = postAndAsyncReply channel (fun tcs -> GetSchemaProvider (tcs, topicName))
                 return Some provider
             else
                 return None
@@ -215,7 +213,7 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
             let patternInfo = { InitialTopics = consumerInfos; GetTopics = getTopicsFun; GetConsumerInfo = getConsumerInfoFun }
             let! consumer = MultiTopicsConsumerImpl.InitPattern(consumerConfig, config, connectionPool,
                                                             patternInfo, lookupService, interceptors, removeConsumer)
-            do! ch.Writer.WriteAsync(AddConsumer consumer)
+            addConsumer consumer
             return consumer :> IConsumer<'T>
         }
         
@@ -229,7 +227,7 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
                 |> Task.WhenAll            
             let! consumer = MultiTopicsConsumerImpl.InitMultiTopic(consumerConfig, config, connectionPool, partitionsForTopis,
                                                              lookupService, interceptors, removeConsumer)
-            do! ch.Writer.WriteAsync(AddConsumer consumer)
+            addConsumer consumer
             return consumer :> IConsumer<'T>
         }
     
@@ -250,13 +248,13 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
                 }                
                 let! consumer = MultiTopicsConsumerImpl.InitPartitioned(consumerConfig, config, connectionPool, consumerInitInfo,
                                                              lookupService, interceptors, removeConsumer)
-                do! ch.Writer.WriteAsync(AddConsumer consumer)
+                addConsumer consumer
                 return consumer :> IConsumer<'T>
             else
                 let! consumer = ConsumerImpl.Init(consumerConfig, config, consumerConfig.SingleTopic, connectionPool, -1, false,
                                                   None, TimeSpan.Zero, lookupService, true, activeSchema, schemaProvider,
                                                   interceptors, removeConsumer)
-                do! ch.Writer.WriteAsync(AddConsumer consumer)
+                addConsumer consumer
                 return consumer :> IConsumer<'T>
         }
 
@@ -274,16 +272,16 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
                     activeSchema <- autoProduceSchema |> unbox
                 | None ->
                     ()                    
-            let removeProducer = fun producer -> ch.Writer.TryWrite(RemoveProducer producer) |> ignore
+            let removeProducer = fun producer -> post channel (RemoveProducer producer)
             if (metadata.IsMultiPartitioned) then
                 let! producer = PartitionedProducerImpl.Init(producerConfig, config, connectionPool, metadata.Partitions,
                                                              lookupService, activeSchema, interceptors, removeProducer)
-                do! ch.Writer.WriteAsync(AddProducer producer)
+                post channel (AddProducer producer)
                 return producer :> IProducer<'T>
             else
                 let! producer = ProducerImpl.Init(producerConfig, config, connectionPool, -1, lookupService,
                                                   activeSchema, interceptors, removeProducer)
-                do! ch.Writer.WriteAsync(AddProducer producer)
+                post channel (AddProducer producer)
                 return producer :> IProducer<'T>
         }
 
@@ -308,11 +306,11 @@ type PulsarClient internal (config: PulsarClientConfiguration) as this =
                                                              schema, schemaProvider, lookupService)
                 else
                     ReaderImpl.Init(readerConfig, config, connectionPool, schema, schemaProvider, lookupService)
-            do! ch.Writer.WriteAsync(AddConsumer reader)
+            post channel (AddConsumer reader)
             return reader
         }
 
-    member private this.Ch with get(): Channel<PulsarClientMessage> = ch
+    member private this.Mb with get(): Channel<PulsarClientMessage> = channel
 
     member private this.ClientState
         with get() = Volatile.Read(&clientState)
