@@ -181,11 +181,11 @@ type internal AcknowledgmentsGroupingTracker(prefix: string, consumerId: Consume
             return ()
         }
     
-    let ch = Channel.CreateUnbounded<GroupingTrackerMessage>(UnboundedChannelOptions(SingleReader = true, AllowSynchronousContinuations = true))
+    let channel = Channel.CreateUnbounded<GroupingTrackerMessage>(UnboundedChannelOptions(SingleReader = true, AllowSynchronousContinuations = true))
     do task {
         while(true) do
             try
-                let! message = ch.Reader.ReadAsync()
+                let! message = channel.Reader.ReadAsync()
                 match message with
                 | GroupingTrackerMessage.IsDuplicate (msgId, channel) ->
                     if msgId <= lastCumulativeAck then
@@ -240,7 +240,7 @@ type internal AcknowledgmentsGroupingTracker(prefix: string, consumerId: Consume
         if ackGroupTime <> TimeSpan.Zero then
             timer.Interval <- ackGroupTime.TotalMilliseconds
             timer.AutoReset <- true
-            timer.Elapsed.Add(fun _ -> ch.Writer.TryWrite(Flush) |> ignore)
+            timer.Elapsed.Add(fun _ -> post channel Flush)
             timer.Start()
     do tryLaunchTimer()
 
@@ -248,23 +248,20 @@ type internal AcknowledgmentsGroupingTracker(prefix: string, consumerId: Consume
         /// Since the ack are delayed, we need to do some best-effort duplicate check to discard messages that are being
         /// resent after a disconnection and for which the user has already sent an acknowledgement.
         member this.IsDuplicate(msgId) =
-            task {
-                let cts = TaskCompletionSource<bool>(TaskContinuationOptions.RunContinuationsAsynchronously)
-                ch.Writer.TryWrite(GroupingTrackerMessage.IsDuplicate (msgId, cts)) |> ignore
-                let! result = cts.Task
-                return result
-            } |> Async.AwaitTask |> Async.RunSynchronously
+            postAndAsyncReply channel (fun cts -> GroupingTrackerMessage.IsDuplicate (msgId, cts))
+            |> Async.AwaitTask
+            |> Async.RunSynchronously
         member this.AddAcknowledgment(msgId, ackType, properties) =
-            ch.Writer.TryWrite(GroupingTrackerMessage.AddAcknowledgment(msgId, ackType, properties)) |> ignore
+            post channel (GroupingTrackerMessage.AddAcknowledgment (msgId, ackType, properties))
         member this.AddBatchIndexAcknowledgment(msgId, ackType, properties) =
-            ch.Writer.TryWrite(GroupingTrackerMessage.AddBatchIndexAcknowledgment(msgId, ackType, properties)) |> ignore
+            post channel (GroupingTrackerMessage.AddBatchIndexAcknowledgment (msgId, ackType, properties))
         member this.Flush() =
-            ch.Writer.TryWrite(GroupingTrackerMessage.Flush) |> ignore
+            post channel GroupingTrackerMessage.Flush
         member this.FlushAndClean() =
-            ch.Writer.TryWrite(GroupingTrackerMessage.FlushAndClean) |> ignore
+            post channel GroupingTrackerMessage.FlushAndClean
         member this.Close() =
             timer.Stop()
-            ch.Writer.TryWrite(GroupingTrackerMessage.Stop) |> ignore
+            post channel GroupingTrackerMessage.Stop
 
     static member NonPersistentAcknowledgmentGroupingTracker =
         {
